@@ -9,225 +9,257 @@ from sklearn.metrics import accuracy_score, classification_report
 from sklearn.naive_bayes import MultinomialNB
 import bcrypt
 
-# Database connection function with caching
-@st.cache_resource
-def get_db_connection():
-    conn = sqlite3.connect('users.db', check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
+class DatabaseHandler:
+    def __init__(self):
+        self.conn = self._get_db_connection()
+        self.create_tables()
+        
+    @st.cache_resource
+    def _get_db_connection(_self):
+        conn = sqlite3.connect('users.db', check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+    
+    def create_tables(self):
+        with self.conn:
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS users 
+                               (username TEXT PRIMARY KEY, password TEXT, profile_pic TEXT)''')
+            self.conn.execute('''CREATE TABLE IF NOT EXISTS sentiment_analysis_results 
+                               (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, text TEXT, 
+                               sentiment TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+            self.conn.commit()
+    
+    def add_user(self, username, password, profile_pic):
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+        try:
+            with self.conn:
+                self.conn.execute('INSERT INTO users VALUES (?, ?, ?)', 
+                                 (username, hashed_password.decode('utf-8'), profile_pic))
+                self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    
+    def get_user(self, username):
+        with self.conn:
+            return self.conn.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+    
+    def add_analysis_result(self, username, text, sentiment):
+        with self.conn:
+            self.conn.execute('''INSERT INTO sentiment_analysis_results 
+                               (username, text, sentiment) VALUES (?, ?, ?)''', 
+                            (username, text, sentiment))
+            self.conn.commit()
+    
+    def get_analysis_results(self, username):
+        with self.conn:
+            return self.conn.execute('''SELECT text, sentiment, timestamp 
+                                      FROM sentiment_analysis_results 
+                                      WHERE username=? 
+                                      ORDER BY timestamp DESC''', (username,)).fetchall()
+    
+    def get_sentiment_counts(self, username):
+        with self.conn:
+            results = self.conn.execute('''SELECT sentiment, COUNT(*) 
+                                          FROM sentiment_analysis_results 
+                                          WHERE username=? 
+                                          GROUP BY sentiment''', (username,)).fetchall()
+        return dict(results) if results else {'positive': 0, 'negative': 0}
 
-conn = get_db_connection()
-c = conn.cursor()
-
-# Create database tables if they don’t exist
-def create_tables():
-    with conn:
-        c.execute('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, profile_pic TEXT)')
-        c.execute('''CREATE TABLE IF NOT EXISTS sentiment_analysis_results (
-                     id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, text TEXT, sentiment TEXT, 
-                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
-        conn.commit()
-
-create_tables()
-
-# Initialize session state
-if 'username' not in st.session_state:
-    st.session_state['username'] = 'Guest'
-if 'profile_pic' not in st.session_state:
-    st.session_state['profile_pic'] = "/Users/aaditya/Desktop/ML_Project copy/a.webp"
-
-# User functions
-def signup(username, password, profile_pic):
-    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-    try:
-        with conn:
-            conn.execute('INSERT INTO users (username, password, profile_pic) VALUES (?, ?, ?)', 
-                         (username, hashed_password.decode('utf-8'), profile_pic))
-            conn.commit()
-        return True
-    except sqlite3.IntegrityError:
+class UserAuth:
+    def __init__(self, db_handler):
+        self.db = db_handler
+        self._init_session_state()
+        
+    def _init_session_state(self):
+        if 'username' not in st.session_state:
+            st.session_state['username'] = 'Guest'
+        if 'profile_pic' not in st.session_state:
+            st.session_state['profile_pic'] = "a.webp"
+    
+    def signup(self, username, password, profile_pic):
+        if self.db.add_user(username, password, profile_pic):
+            st.session_state.update({
+                'username': username,
+                'profile_pic': profile_pic
+            })
+            return True
+        return False
+    
+    def login(self, username, password):
+        user = self.db.get_user(username)
+        if user and bcrypt.checkpw(password.encode('utf-8'), user[1].encode('utf-8')):
+            st.session_state.update({
+                'username': user[0],
+                'profile_pic': user[2] or "a.webp"
+            })
+            return True
         return False
 
-def login(username, password):
-    with conn:
-        user = conn.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
-        if user and bcrypt.checkpw(password.encode('utf-8'), user[1].encode('utf-8')):
-            st.session_state['username'] = username
-            st.session_state['profile_pic'] = user[2] if user[2] else "/Users/aaditya/Desktop/ML_Project copy/a.webp"
-            return True
-    return False
+class SentimentAnalyzer:
+    def __init__(self):
+        self.vectorizer = None
+        self.classifier = None
+        self.accuracy = None
+        self.report = None
+        self._initialize_model()
+
+    @st.cache_data
+    def _load_data(_self):
+        columns = ['id', 'entity', 'sentiment', 'text']
+        train_data = pd.read_csv('twitter_training.csv', names=columns, header=None)
+        test_data = pd.read_csv('twitter_validation.csv', names=columns, header=None)
+        return train_data, test_data
+
+    @st.cache_resource
+    def _train_model(_self, train_data, test_data):
+        # Helper to process data
+        def process_df(df):
+            df = df[df['sentiment'].isin(['Positive', 'Negative'])]
+            df['sentiment_numeric'] = df['sentiment'].map({'Negative': 0, 'Positive': 1})
+            return df.dropna(subset=['sentiment_numeric', 'text'])
+
+        # Clean and prepare data
+        train_data = process_df(train_data)
+        test_data = process_df(test_data)
+        
+        X_train = train_data['text']
+        y_train = train_data['sentiment_numeric']
+        X_test = test_data['text']
+        y_test = test_data['sentiment_numeric']
+        
+        # Vectorize text
+        vectorizer = TfidfVectorizer()
+        X_train_vec = vectorizer.fit_transform(X_train)
+        X_test_vec = vectorizer.transform(X_test)
+        
+        # Train classifier
+        classifier = MultinomialNB()
+        classifier.fit(X_train_vec, y_train)
+        
+        # Calculate metrics
+        y_pred = classifier.predict(X_test_vec)
+        accuracy = accuracy_score(y_test, y_pred)
+        report = classification_report(y_test, y_pred, target_names=['negative', 'positive'])
+        
+        return vectorizer, classifier, accuracy, report
+
+    def _initialize_model(self):
+        train_data, test_data = self._load_data()
+        self.vectorizer, self.classifier, self.accuracy, self.report = self._train_model(train_data, test_data)
+
+    def predict(self, text):
+        if not text.strip():
+            return None
+        vec_text = self.vectorizer.transform([text])
+        prediction = self.classifier.predict(vec_text)[0]
+        return 'positive' if prediction == 1 else 'negative'
     
-# Display trainer card
-def display_trainer_card():
-    st.sidebar.image(st.session_state['profile_pic'], use_container_width=True)
-    st.sidebar.title(f"{st.session_state['username'].capitalize()} - Sentiment Analyst")
-
-# Load data with caching to avoid reloading
-@st.cache_data
-def load_data(file_path):
-    column_names = ['sentiment', 'id', 'date', 'flag', 'user', 'text']
-    data = pd.read_csv(file_path, header=None, names=column_names, encoding='ISO-8859-1')
-    return data
-
-# Preprocess and split data, then cache the result to avoid recomputation
-@st.cache_data
-def preprocess_data(data):
-    sentiment_map = {0: 0, 4: 1}
-    data['sentiment_numeric'] = data['sentiment'].map(sentiment_map)
-    data = data.dropna(subset=['sentiment_numeric', 'text'])
-
-    X = data['text']
-    y = data['sentiment_numeric']
-    return train_test_split(X, y, test_size=0.2, random_state=42)
-
-# Train and cache model and vectorizer for reuse
-@st.cache_resource
-def train_model(X_train, X_test, y_train, y_test):
-    vectorizer = TfidfVectorizer()
-    X_train_vectorized = vectorizer.fit_transform(X_train)
-    X_test_vectorized = vectorizer.transform(X_test)
-
-    classifier = MultinomialNB()
-    classifier.fit(X_train_vectorized, y_train)
-
-    y_pred = classifier.predict(X_test_vectorized)
-    accuracy = accuracy_score(y_test, y_pred)
-    report = classification_report(y_test, y_pred, target_names=['negative', 'positive'])
-
-    return classifier, vectorizer, accuracy, report
-
-# Perform prediction
-def make_prediction(classifier, vectorizer, text):
-    text_vectorized = vectorizer.transform([text])
-    prediction = classifier.predict(text_vectorized)
-    return 'positive' if prediction[0] == 1 else 'negative'
-
-# Main app interface
-def main_app():
-    st.sidebar.title("Navigation")
-    page = st.sidebar.selectbox("Choose a page", ["Login", "Sign Up", "Continue as Guest", "Sentiment Analysis", "Metrics"])
-
-    if page == "Login":
-        login_page()
-    elif page == "Sign Up":
-        signup_page()
-    elif page == "Continue as Guest":
-        continue_as_guest_page()
-    elif page == "Sentiment Analysis":
-        display_trainer_card()
-        sentiment_analysis_page()
-    elif page == "Metrics":
-        display_metrics_page()
-
-# Login page
-def login_page():
-    st.title("Login")
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if login(username, password):
-            st.success(f"Welcome back, {st.session_state['username']}!")
+class App:
+    def __init__(self):
+        self.db = DatabaseHandler()
+        self.auth = UserAuth(self.db)
+        self.analyzer = SentimentAnalyzer()
+    
+    def run(self):
+        self._render_sidebar()
+        self._handle_page_navigation()
+    
+    def _render_sidebar(self):
+        st.sidebar.title("Navigation")
+        st.sidebar.image(
+            st.session_state['profile_pic'], 
+            caption=st.session_state['username'],
+            use_container_width=True
+        )
+        self.current_page = st.sidebar.selectbox("Choose a page", [
+            "Login", "Sign Up", "Continue as Guest", 
+            "Sentiment Analysis", "Metrics"
+        ])
+    
+    def _handle_page_navigation(self):
+        if self.current_page == "Login":
+            self._render_login_page()
+        elif self.current_page == "Sign Up":
+            self._render_signup_page()
+        elif self.current_page == "Continue as Guest":
+            self._render_guest_page()
+        elif self.current_page == "Sentiment Analysis":
+            self._render_analysis_page()
+        elif self.current_page == "Metrics":
+            self._render_metrics_page()
+    
+    def _render_login_page(self):
+        st.title("Login")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type='password')
+        if st.button("Login"):
+            if self.auth.login(username, password):
+                st.success(f"Welcome back {username}!")
+            else:
+                st.error("Invalid credentials")
+    
+    def _render_signup_page(self):
+        st.title("Sign Up")
+        username = st.text_input("New Username")
+        password = st.text_input("New Password", type='password')
+        profile_pic = self._handle_profile_pic_upload()
+        
+        if st.button("Create Account"):
+            if self.auth.signup(username, password, profile_pic):
+                st.success("Account created successfully!")
+            else:
+                st.error("Username already exists")
+    
+    def _handle_profile_pic_upload(self):
+        st.subheader("Profile Picture")
+        default_pic = "a.webp"
+        uploaded = st.file_uploader("Upload image (optional)", type=["jpg", "png", "jpeg"])
+        return (
+            f"data:image/jpeg;base64,{base64.b64encode(uploaded.read()).decode()}" 
+            if uploaded else default_pic
+        )
+    
+    def _render_guest_page(self):
+        st.title("Guest Mode")
+        st.session_state.update({
+            'username': 'Guest',
+            'profile_pic': "a.webp"
+        })
+        st.info("Using guest account with limited features")
+    
+    def _render_analysis_page(self):
+        st.title("Sentiment Analysis")
+        text_input = st.text_area("Enter text for analysis")
+        
+        if st.button("Analyze"):
+            sentiment = self.analyzer.predict(text_input)
+            if sentiment:
+                self._display_result(text_input, sentiment)
+                self.db.add_analysis_result(st.session_state['username'], text_input, sentiment)
+                self._show_previous_results()
+    
+    def _display_result(self, text, sentiment):
+        st.success("Analysis Complete!")
+        st.markdown(f"**Text:** {text}")
+        st.markdown(f"**Sentiment:** {sentiment.capitalize()}")
+    
+    def _show_previous_results(self):
+        st.subheader("History")
+        results = self.db.get_analysis_results(st.session_state['username'])
+        if results:
+            st.table(pd.DataFrame(results, columns=["Text", "Sentiment", "Timestamp"]))
+    
+    def _render_metrics_page(self):
+        st.title("Analysis Metrics")
+        counts = self.db.get_sentiment_counts(st.session_state['username'])
+        
+        st.subheader("Sentiment Distribution")
+        if counts:
+            st.bar_chart(pd.DataFrame.from_dict(counts, orient='index'))
         else:
-            st.error("Invalid username or password.")
+            st.info("No analysis data available")
 
-# Sign Up page
-def signup_page():
-    st.title("Sign Up")
-    username = st.text_input("New Username")
-    password = st.text_input("New Password", type="password")
-
-    # Profile picture selection
-    st.subheader("Choose a Profile Picture")
-    default_picture = "/Users/aaditya/Desktop/ML_Project copy/a.webp"
-    uploaded_file = st.file_uploader("Upload your own picture (optional)", type=["jpg", "jpeg", "png"])
-
-    if uploaded_file is not None:
-        # Convert the uploaded file to a base64 string
-        profile_pic = f"data:image/jpeg;base64,{base64.b64encode(uploaded_file.read()).decode()}"
-    else:
-        profile_pic = default_picture
-
-    if st.button("Sign Up"):
-        if signup(username, password, profile_pic):
-            st.success(f"Account created successfully. Welcome, {username}!")
-            st.session_state['username'] = username
-            st.session_state['profile_pic'] = profile_pic
-        else:
-            st.error("Username already taken. Please choose another.")
-
-# Continue as Guest page
-def continue_as_guest_page():
-    st.title("Continue as Guest")
-    st.session_state['username'] = "Guest"
-    st.info("You are continuing as Guest.")
-
-# Sentiment analysis interface
-def sentiment_analysis_page():
-    st.markdown("<h1 class='big-font'>Sentiment Analyser</h1>", unsafe_allow_html=True)
-    st.write("Welcome to the world of Sentiment Analysis!")
-
-    data = load_data('training.1600000.processed.noemoticon.csv')
-    if data is None:
-        st.error("Failed to load data.")
-        return
-
-    X_train, X_test, y_train, y_test = preprocess_data(data)
-    classifier, vectorizer, accuracy, report = train_model(X_train, X_test, y_train, y_test)
-    if classifier is None or vectorizer is None:
-        st.error("Model training failed.")
-        return
-
-    text = st.text_area("Enter a piece of text to analyze:")
-    if st.button("Analyze Sentiment"):
-        if text.strip() == "":
-            st.warning("Please enter some text to analyze.")
-        else:
-            with st.spinner("Analyzing..."):
-                prediction = make_prediction(classifier, vectorizer, text)
-            st.success("Analysis complete!")
-            st.markdown(f"<h2>Sentiment: {prediction}</h2>", unsafe_allow_html=True)
-
-            store_sentiment_analysis_results(st.session_state['username'], text, prediction)
-            display_previous_results()
-
-# Store sentiment analysis results in the database
-def store_sentiment_analysis_results(username, text, sentiment):
-    with conn:
-        conn.execute('INSERT INTO sentiment_analysis_results (username, text, sentiment, timestamp) VALUES (?, ?, ?, ?)', 
-                     (username, text, sentiment, datetime.now()))
-        conn.commit()
-
-# Display previous sentiment analysis results
-def display_previous_results():
-    previous_results = conn.execute('SELECT text, sentiment, timestamp FROM sentiment_analysis_results WHERE username=? ORDER BY timestamp DESC', (st.session_state['username'],)).fetchall()
-    if previous_results:
-        st.write("Previous Sentiment Analysis Results:")
-        results_df = pd.DataFrame(previous_results, columns=['Text', 'Sentiment', 'Timestamp'])
-        st.write(results_df)
-
-# Display metrics page with a bar chart and metrics for logged-in user
-def display_metrics_page():
-    st.title("Metrics")
-
-    previous_results = conn.execute('SELECT sentiment FROM sentiment_analysis_results WHERE username=?', (st.session_state['username'],)).fetchall()
-    if previous_results:
-        sentiment_counts = {'positive': 0, 'negative': 0}
-        for result in previous_results:
-            if result[0] == 'positive':
-                sentiment_counts['positive'] += 1
-            elif result[0] == 'negative':
-                sentiment_counts['negative'] += 1
-
-        st.subheader("Sentiment Counts")
-        sentiment_counts_df = pd.DataFrame.from_dict(sentiment_counts, orient='index', columns=['Count'])
-        st.bar_chart(sentiment_counts_df)
-
-        st.subheader("Analysis Metrics")
-        st.metric(label="Total Positive Sentiments", value=sentiment_counts['positive'])
-        st.metric(label="Total Negative Sentiments", value=sentiment_counts['negative'])
-    else:
-        st.info("No sentiment analysis results to display for this user.")
-
-# Run the app
 if __name__ == "__main__":
-    main_app()
+    app = App()
+    app.run()
